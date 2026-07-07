@@ -7,3 +7,4 @@ videos/*.avi
 videos/*.mov
 .env
 .streamlit/secrets.toml
+*.pt
