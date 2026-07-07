@@ -1,0 +1,8 @@
+streamlit
+ultralytics
+opencv-python-headless
+groq
+python-dotenv
+pandas
+plotly
+numpy
