@@ -209,20 +209,25 @@ if uploaded_file is not None:
             pct = min(frame_count / max(total_frames, 1), 1.0)
             progress_bar.progress(pct, text=f"Frame {frame_count}/{total_frames} · {confirmed} found")
 
-        summary2 = run_phase2(save_path, progress_callback=progress_callback)
-        with st.sidebar:
-            with st.spinner("Analyzing colors..."):
-                run_phase3(save_path)
-            with st.spinner("Verifying truck/bus classifications..."):
-                verify_result = verify_truck_bus(save_path)
-                if verify_result["corrected"] > 0:
-                    st.info(f"Corrected {verify_result['corrected']} truck/bus mismatches")
-            with st.spinner("Indexing..."):
-                run_phase5(save_path)
+        try:
+            summary2 = run_phase2(save_path, progress_callback=progress_callback)
+            with st.sidebar:
+                with st.spinner("Analyzing colors..."):
+                    run_phase3(save_path)
+                with st.spinner("Verifying truck/bus classifications..."):
+                    verify_result = verify_truck_bus(save_path)
+                    if verify_result["corrected"] > 0:
+                        st.info(f"Corrected {verify_result['corrected']} truck/bus mismatches")
+                with st.spinner("Indexing..."):
+                    run_phase5(save_path)
 
-        st.session_state.is_processing = False
-        st.sidebar.success(f"✅ {summary2['confirmed']} vehicles indexed")
-        st.rerun()
+            st.session_state.is_processing = False
+            st.sidebar.success(f"✅ {summary2['confirmed']} vehicles indexed")
+            st.rerun()
+        except Exception as e:
+            st.session_state.is_processing = False
+            st.sidebar.error(f"❌ Processing failed: {e}")
+            st.exception(e)
 
 st.sidebar.markdown('<div class="nav-divider"></div>', unsafe_allow_html=True)
 st.sidebar.subheader("🗑️ Manage videos")
