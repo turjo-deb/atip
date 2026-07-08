@@ -1,6 +1,6 @@
 # 🚦 TrafficLens (ATIP — Automated Traffic Intelligence Platform)
 
-**Team KUET_Technomancers · SciBlitz AI Challenge 2026 · IEEE Student Branch, CUET**
+**Team Technomancers · SciBlitz AI Challenge 2026 · IEEE Student Branch, CUET**
 
 🔴 **Live demo:** https://huggingface.co/spaces/turjodeb/atip
 
