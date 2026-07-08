@@ -158,6 +158,116 @@ def delete_video(video_id):
         if os.path.exists(video_file):
             os.remove(video_file)
 
+
+def get_video_rows(video_id):
+    """All vehicle rows for a video, flattened with key VLM fields — used by export & report."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT track_id, vehicle_type, color, timestamp_seconds, direction, crop_path, vlm_data
+        FROM vehicles WHERE video_id=? ORDER BY timestamp_seconds
+    """, (video_id,))
+    rows = cur.fetchall()
+    conn.close()
+
+    records = []
+    for track_id, vtype, color, ts, direction, crop_path, vlm_raw in rows:
+        vd = json.loads(vlm_raw) if vlm_raw else {}
+        records.append({
+            "track_id": track_id,
+            "vehicle_type": vtype,
+            "color": color,
+            "timestamp_seconds": round(ts or 0, 2),
+            "direction": direction or "",
+            "dominant_color_ai": vd.get("dominant_color", ""),
+            "cargo": "; ".join(vd.get("cargo", [])),
+            "cargo_location": vd.get("cargo_location", ""),
+            "roof_items": "; ".join(vd.get("roof_items", [])),
+            "text_or_ads": "; ".join(vd.get("advertisement_or_text", [])),
+            "special_vehicle": vd.get("special_vehicle_type", ""),
+            "description": "; ".join(vd.get("description", [])),
+            "crop_path": crop_path or "",
+        })
+    return records
+
+
+def build_html_report(video_id, records):
+    """Self-contained HTML report (charts as inline plotly PNGs skipped — pure HTML/CSS bars, prints fine)."""
+    import base64 as _b64
+    from datetime import datetime
+
+    total = len(records)
+    by_type, by_dir, by_color = {}, {"up": 0, "down": 0}, {}
+    for r in records:
+        by_type[r["vehicle_type"]] = by_type.get(r["vehicle_type"], 0) + 1
+        if r["direction"] in by_dir:
+            by_dir[r["direction"]] += 1
+        by_color[r["color"]] = by_color.get(r["color"], 0) + 1
+
+    def bar_rows(d):
+        mx = max(d.values()) if d else 1
+        return "".join(
+            f"<tr><td>{k}</td><td><div class='bar' style='width:{int(280*v/mx)}px'></div> {v}</td></tr>"
+            for k, v in sorted(d.items(), key=lambda x: -x[1])
+        )
+
+    # timeline buckets (10s)
+    buckets = {}
+    for r in records:
+        b = int(r["timestamp_seconds"] // 10) * 10
+        buckets[b] = buckets.get(b, 0) + 1
+    timeline_rows = "".join(
+        f"<tr><td>{b}–{b+10}s</td><td><div class='bar' style='width:{int(280*v/max(buckets.values()))}px'></div> {v}</td></tr>"
+        for b, v in sorted(buckets.items())
+    ) if buckets else ""
+
+    # notable vehicles: has cargo, text, or special — top 12 with embedded crops
+    notable = [r for r in records if r["cargo"] or r["text_or_ads"] or (r["special_vehicle"] and r["special_vehicle"] != "none")][:12]
+    cards = ""
+    for r in notable:
+        img_tag = ""
+        if r["crop_path"] and os.path.exists(r["crop_path"]):
+            try:
+                with open(r["crop_path"], "rb") as f:
+                    img_tag = f"<img src='data:image/jpeg;base64,{_b64.b64encode(f.read()).decode()}'/>"
+            except Exception:
+                pass
+        details = " · ".join(x for x in [
+            r["cargo"] and f"Carrying: {r['cargo']}",
+            r["text_or_ads"] and f"Text: {r['text_or_ads']}",
+            r["special_vehicle"] not in ("", "none") and f"⚠ {r['special_vehicle']}",
+        ] if x)
+        cards += f"""<div class='card'>{img_tag}<div><b>{r['vehicle_type'].capitalize()}</b> · {r['color']} · {r['timestamp_seconds']}s<br><small>{details}</small></div></div>"""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><title>ATIP Report — {video_id}</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:900px;margin:30px auto;color:#1a1a2e;padding:0 16px}}
+h1{{color:#0d9488}} h2{{border-bottom:2px solid #0d9488;padding-bottom:4px;margin-top:32px}}
+table{{border-collapse:collapse}} td{{padding:4px 12px 4px 0;vertical-align:middle}}
+.bar{{display:inline-block;height:14px;background:#0d9488;border-radius:3px;vertical-align:middle}}
+.metrics{{display:flex;gap:24px;flex-wrap:wrap;margin:16px 0}}
+.metric{{background:#f0fdfa;border:1px solid #99f6e4;border-radius:10px;padding:14px 22px;text-align:center}}
+.metric b{{font-size:1.6rem;color:#0d9488;display:block}}
+.card{{display:flex;gap:12px;align-items:center;border:1px solid #ddd;border-radius:10px;padding:10px;margin:8px 0}}
+.card img{{width:110px;border-radius:8px}}
+footer{{margin-top:40px;color:#888;font-size:0.85rem;text-align:center}}
+</style></head><body>
+<h1>🚦 TrafficLens Report</h1>
+<p><b>Video:</b> {video_id} &nbsp;·&nbsp; <b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+<div class='metrics'>
+  <div class='metric'><b>{total}</b>Total vehicles</div>
+  <div class='metric'><b>{by_dir['up']}</b>⬆ Up</div>
+  <div class='metric'><b>{by_dir['down']}</b>⬇ Down</div>
+</div>
+<h2>Vehicles by type</h2><table>{bar_rows(by_type)}</table>
+<h2>Vehicles by color</h2><table>{bar_rows(by_color)}</table>
+<h2>Traffic over time</h2><table>{timeline_rows}</table>
+<h2>Notable vehicles</h2>{cards if cards else "<p>None flagged.</p>"}
+<footer>Generated by TrafficLens · Team KUET_Technomancers · SciiBlitz 2.0</footer>
+</body></html>"""
+    return html
+
+
 def guarded(clicked):
     """Wrap any button click — if processing, show a toast and ignore the click."""
     if clicked and st.session_state.is_processing:
@@ -306,6 +416,43 @@ if page == "📊 Dashboard":
                           font_color="#e5e9f0", height=300)
         st.plotly_chart(fig, use_container_width=True)
 
+        records = get_video_rows(selected_video)
+
+        # Direction split
+        ups = sum(1 for r in records if r["direction"] == "up")
+        downs = sum(1 for r in records if r["direction"] == "down")
+        dcol1, dcol2 = st.columns(2)
+        dcol1.metric("⬆️ Going up", ups)
+        dcol2.metric("⬇️ Going down", downs)
+
+        # Traffic timeline (10s buckets)
+        if records:
+            tdf = pd.DataFrame(records)
+            tdf["time_bucket"] = (tdf["timestamp_seconds"] // 10 * 10).astype(int)
+            timeline = tdf.groupby(["time_bucket", "vehicle_type"]).size().reset_index(name="count")
+            timeline["time"] = timeline["time_bucket"].astype(str) + "s"
+            fig2 = px.bar(timeline, x="time", y="count", color="vehicle_type",
+                          title="Traffic over time (per 10s)",
+                          color_discrete_sequence=["#2dd4bf", "#818cf8", "#f472b6", "#fbbf24"])
+            fig2.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                               font_color="#e5e9f0", height=300, legend_title_text="")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # Exports + report
+        ecol1, ecol2, ecol3 = st.columns(3)
+        if records:
+            edf = pd.DataFrame(records).drop(columns=["crop_path"])
+            ecol1.download_button("⬇️ Export CSV", edf.to_csv(index=False).encode(),
+                                  file_name=f"atip_{selected_video}.csv", mime="text/csv",
+                                  use_container_width=True)
+            ecol2.download_button("⬇️ Export JSON", json.dumps(records, indent=2).encode(),
+                                  file_name=f"atip_{selected_video}.json", mime="application/json",
+                                  use_container_width=True)
+            report_html = build_html_report(selected_video, records)
+            ecol3.download_button("📄 Download report", report_html.encode(),
+                                  file_name=f"atip_report_{selected_video}.html", mime="text/html",
+                                  use_container_width=True)
+
         video_path = f"outputs/{selected_video}/phase2_test.mp4"
         if os.path.exists(video_path):
             st.video(video_path)
@@ -330,13 +477,28 @@ elif page == "🔍 Analyze":
                 if st.checkbox(vid, value=True, key=f"scope_{vid}"):
                     search_scope.append(vid)
 
+        if "recent_searches" not in st.session_state:
+            st.session_state.recent_searches = []
+        if "search_prefill" not in st.session_state:
+            st.session_state.search_prefill = ""
+
         st.markdown('<div class="search-box">', unsafe_allow_html=True)
         query = st.text_input(
             "Search",
+            value=st.session_state.search_prefill,
             placeholder="e.g. red car, bus with yellow back, truck carrying ladder",
             label_visibility="collapsed"
         )
         st.markdown('</div>', unsafe_allow_html=True)
+        st.session_state.search_prefill = ""
+
+        if st.session_state.recent_searches:
+            st.caption("🕘 Recent searches:")
+            rcols = st.columns(len(st.session_state.recent_searches))
+            for ri, rq in enumerate(st.session_state.recent_searches):
+                if rcols[ri].button(rq, key=f"recent_{ri}", use_container_width=True):
+                    st.session_state.search_prefill = rq
+                    st.rerun()
 
         FUN_FACTS = [
             "🤖 AI is peeking at the pixels...",
@@ -353,6 +515,13 @@ elif page == "🔍 Analyze":
                 vlm_call_count["n"] += 1
                 fact = FUN_FACTS[vlm_call_count["n"] % len(FUN_FACTS)]
                 status_placeholder.info(f"{fact} (vehicle #{track_id})")
+
+            q_clean = query.strip()
+            if q_clean and (not st.session_state.recent_searches or st.session_state.recent_searches[0] != q_clean):
+                if q_clean in st.session_state.recent_searches:
+                    st.session_state.recent_searches.remove(q_clean)
+                st.session_state.recent_searches.insert(0, q_clean)
+                st.session_state.recent_searches = st.session_state.recent_searches[:5]
 
             all_matches = []
             with st.spinner("Searching..."):
@@ -385,9 +554,15 @@ elif page == "🔍 Analyze":
                         if ads:
                             st.caption(f"📝 Text/logo: {', '.join(ads)}")
 
-                        if guarded(st.button("💾 Save", key=f"save_{m['video_id']}_{m['track_id']}")):
+                        bcol1, bcol2 = st.columns(2)
+                        if guarded(bcol1.button("💾 Save", key=f"save_{m['video_id']}_{m['track_id']}", use_container_width=True)):
                             toggle_saved(m["video_id"], m["track_id"], 1)
                             st.toast("Saved to Library!")
+                        if m["crop_path"] and os.path.exists(m["crop_path"]):
+                            with open(m["crop_path"], "rb") as _f:
+                                bcol2.download_button("⬇️", _f.read(),
+                                    file_name=os.path.basename(m["crop_path"]), mime="image/jpeg",
+                                    key=f"dl_{m['video_id']}_{m['track_id']}", use_container_width=True)
             else:
                 st.warning("No matches found. Try a different query.")
         elif query and not search_scope:
@@ -429,8 +604,14 @@ else:
                         loc_txt = f" ({loc.replace('_', ' ')})" if loc and loc != "none" else ""
                         st.caption(f"🚛 Carrying: {', '.join(cargo)}{loc_txt}")
 
-                if guarded(st.button("🗑️ Remove", key=f"del_{video_id}_{track_id}")):
+                lcol1, lcol2 = st.columns(2)
+                if guarded(lcol1.button("🗑️ Remove", key=f"del_{video_id}_{track_id}", use_container_width=True)):
                     toggle_saved(video_id, track_id, 0)
                     st.rerun()
+                if crop_path and os.path.exists(crop_path):
+                    with open(crop_path, "rb") as _f:
+                        lcol2.download_button("⬇️", _f.read(),
+                            file_name=os.path.basename(crop_path), mime="image/jpeg",
+                            key=f"libdl_{video_id}_{track_id}", use_container_width=True)
 
     render_footer()
