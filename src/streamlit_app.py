@@ -18,8 +18,6 @@ from phase5_db import run_phase5, init_db, DB_PATH
 from phase6_search import search_multi, run_eager_vlm
 
 st.set_page_config(page_title="TrafficLens", layout="wide", initial_sidebar_state="expanded")
-_k = os.getenv("GROQ_API_KEYS")
-st.info(f"DEBUG: GROQ_API_KEYS is {'SET (' + str(len(_k.split(','))) + ' keys)' if _k else 'MISSING'}")
 
 st.markdown("""
 <style>
