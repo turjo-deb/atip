@@ -14,6 +14,7 @@ from groq import Groq
 import itertools
 
 load_dotenv()
+print("DEBUG GROQ_API_KEYS:", repr(os.getenv("GROQ_API_KEYS")))
 
 CROPS_DIR = "outputs/crops"
 OUTPUT_JSON = "outputs/vlm_descriptions.json"
@@ -24,7 +25,11 @@ MAX_CALLS_PER_MINUTE = 28  # stay a hair under Groq's ~30 RPM cap on this model
 
 API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").split(",") if k.strip()]
 if not API_KEYS:
-    API_KEYS = [os.getenv("GROQ_API_KEY")]
+    single = os.getenv("GROQ_API_KEY")
+    API_KEYS = [single] if single else []
+if not API_KEYS:
+    print("WARNING: no GROQ_API_KEYS/GROQ_API_KEY found in environment")
+    API_KEYS = ["MISSING_KEY_PLACEHOLDER"]
 
 _key_cycle = itertools.cycle(API_KEYS)
 _current_key = next(_key_cycle)

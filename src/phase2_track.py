@@ -55,7 +55,7 @@ def upscale_if_small(img):
     return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
 
-def run_phase2(video_path, progress_callback=None):
+def run_phase2(video_path, progress_callback=None, line_position=LINE_POSITION):
     """
     Runs detection + single-line tracking on a video.
     progress_callback(frame_count, total_frames, confirmed_count) is called periodically if provided.
@@ -84,7 +84,7 @@ def run_phase2(video_path, progress_callback=None):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
-    LINE_Y = int(h * LINE_POSITION)
+    LINE_Y = int(h * line_position)
     LINE_TOP = LINE_Y - LINE_MARGIN
     LINE_BOTTOM = LINE_Y + LINE_MARGIN
 
