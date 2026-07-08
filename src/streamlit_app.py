@@ -268,6 +268,77 @@ footer{{margin-top:40px;color:#888;font-size:0.85rem;text-align:center}}
     return html
 
 
+
+# ============================================================
+# Watchlist helpers
+# ============================================================
+def add_watchlist_entry(description):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO watchlist (description) VALUES (?)", (description,))
+    conn.commit()
+    conn.close()
+
+
+def get_watchlist():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, description, created_at FROM watchlist WHERE active=1 ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def remove_watchlist_entry(entry_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM watchlist WHERE id=?", (entry_id,))
+    cur.execute("DELETE FROM watchlist_hits WHERE entry_id=?", (entry_id,))
+    conn.commit()
+    conn.close()
+
+
+def record_watchlist_hits(entry_id, matches):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for m in matches:
+        cur.execute(
+            "INSERT OR IGNORE INTO watchlist_hits (entry_id, video_id, track_id) VALUES (?, ?, ?)",
+            (entry_id, m["video_id"], str(m["track_id"]))
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_watchlist_hits(entry_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT v.track_id, v.video_id, v.vehicle_type, v.color, v.crop_path, v.timestamp_seconds
+        FROM watchlist_hits h
+        JOIN vehicles v ON v.video_id = h.video_id AND v.track_id = h.track_id
+        WHERE h.entry_id = ?
+        ORDER BY v.video_id, v.timestamp_seconds
+    """, (entry_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def scan_watchlist(video_ids=None):
+    """Runs every active watchlist entry through search. Returns list of (description, n_matches)."""
+    results = []
+    for entry_id, description, _created in get_watchlist():
+        try:
+            _f, matches = search_multi(description, video_ids=video_ids)
+            if matches:
+                record_watchlist_hits(entry_id, matches)
+            results.append((description, len(matches)))
+        except Exception as e:
+            results.append((description, f"error: {e}"))
+    return results
+
+
 def guarded(clicked):
     """Wrap any button click — if processing, show a toast and ignore the click."""
     if clicked and st.session_state.is_processing:
@@ -301,7 +372,7 @@ st.sidebar.markdown('<div class="tl-tag">AI Traffic Intelligence Platform</div>'
 if "page" not in st.session_state:
     st.session_state.page = "📊 Dashboard"
 
-for label in ["📊 Dashboard", "🔍 Analyze", "💾 Library"]:
+for label in ["📊 Dashboard", "🔍 Analyze", "🚔 Watchlist", "💾 Library"]:
     is_active = st.session_state.page == label
     if guarded(st.sidebar.button(label, key=f"nav_{label}", use_container_width=True,
                               type="primary" if is_active else "secondary")):
@@ -351,6 +422,13 @@ if uploaded_file is not None:
                 vlm_summary = run_eager_vlm(video_id, progress_callback=vlm_progress_cb)
                 if vlm_summary["corrected"] > 0:
                     st.info(f"AI corrected {vlm_summary['corrected']} vehicle classifications")
+
+                if get_watchlist():
+                    with st.spinner("Checking watchlist..."):
+                        wl_results = scan_watchlist(video_ids=[video_id])
+                    for desc, n in wl_results:
+                        if isinstance(n, int) and n > 0:
+                            st.warning(f"🚨 Watchlist hit: '{desc}' — {n} match(es) in {video_id}")
 
             st.session_state.is_processing = False
             st.sidebar.success(f"✅ {summary2['confirmed']} vehicles indexed")
@@ -425,6 +503,27 @@ if page == "📊 Dashboard":
         dcol1.metric("⬆️ Going up", ups)
         dcol2.metric("⬇️ Going down", downs)
 
+        # Emergency vehicles panel
+        emergencies = [r for r in records if r["special_vehicle"] not in ("", "none", None)]
+        if emergencies:
+            st.error(f"🚨 {len(emergencies)} emergency vehicle(s) detected in this video")
+            ecols = st.columns(min(len(emergencies), 4))
+            bucket_counts = {}
+            for r in records:
+                b = int(r["timestamp_seconds"] // 10) * 10
+                bucket_counts[b] = bucket_counts.get(b, 0) + 1
+            for ei, r in enumerate(emergencies):
+                with ecols[ei % len(ecols)]:
+                    if r["crop_path"] and os.path.exists(r["crop_path"]):
+                        st.image(r["crop_path"], use_container_width=True)
+                    b = int(r["timestamp_seconds"] // 10) * 10
+                    n_around = bucket_counts.get(b, 1)
+                    density = "heavy" if n_around >= 8 else ("moderate" if n_around >= 4 else "light")
+                    st.markdown(f"**🚨 {r['special_vehicle'].capitalize()}** · ⏱️ {r['timestamp_seconds']}s")
+                    st.caption(f"Passed during {density} traffic ({n_around} vehicles in that 10s window)")
+        else:
+            st.caption("✅ No emergency vehicles detected in this video.")
+
         # Traffic timeline (10s buckets)
         if records:
             tdf = pd.DataFrame(records)
@@ -494,11 +593,14 @@ elif page == "🔍 Analyze":
 
         if st.session_state.recent_searches:
             st.caption("🕘 Recent searches:")
-            rcols = st.columns(len(st.session_state.recent_searches))
-            for ri, rq in enumerate(st.session_state.recent_searches):
-                if rcols[ri].button(rq, key=f"recent_{ri}", use_container_width=True):
-                    st.session_state.search_prefill = rq
-                    st.rerun()
+            _rs = st.session_state.recent_searches
+            for row_start in range(0, len(_rs), 5):
+                row = _rs[row_start:row_start + 5]
+                rcols = st.columns(5)
+                for ri, rq in enumerate(row):
+                    if rcols[ri].button(rq, key=f"recent_{row_start + ri}", use_container_width=True):
+                        st.session_state.search_prefill = rq
+                        st.rerun()
 
         FUN_FACTS = [
             "🤖 AI is peeking at the pixels...",
@@ -521,7 +623,7 @@ elif page == "🔍 Analyze":
                 if q_clean in st.session_state.recent_searches:
                     st.session_state.recent_searches.remove(q_clean)
                 st.session_state.recent_searches.insert(0, q_clean)
-                st.session_state.recent_searches = st.session_state.recent_searches[:5]
+                st.session_state.recent_searches = st.session_state.recent_searches[:10]
 
             all_matches = []
             with st.spinner("Searching..."):
@@ -567,6 +669,77 @@ elif page == "🔍 Analyze":
                 st.warning("No matches found. Try a different query.")
         elif query and not search_scope:
             st.warning("Select at least one video to search in.")
+
+    render_footer()
+
+
+# ============================================================
+# PAGE: Watchlist
+# ============================================================
+elif page == "🚔 Watchlist":
+    page_header("🚔 Suspect Watchlist", "Standing BOLO descriptions — new videos are checked automatically.")
+
+    if "wl_prefill" not in st.session_state:
+        st.session_state.wl_prefill = ""
+
+    st.caption("💡 Examples (click to use):")
+    EXAMPLES = ["white pickup with dented door", "red car carrying furniture",
+                "truck with company logo", "motorcycle with two riders"]
+    excols = st.columns(len(EXAMPLES))
+    for xi, ex in enumerate(EXAMPLES):
+        if excols[xi].button(ex, key=f"wlex_{xi}", use_container_width=True):
+            st.session_state.wl_prefill = ex
+            st.rerun()
+
+    wcol1, wcol2 = st.columns([4, 1])
+    new_desc = wcol1.text_input("Describe the vehicle to watch for",
+                                value=st.session_state.wl_prefill,
+                                placeholder="e.g. white pickup truck with a dented door and ladder rack",
+                                label_visibility="collapsed")
+    st.session_state.wl_prefill = ""
+    if guarded(wcol2.button("➕ Add", use_container_width=True)) and new_desc.strip():
+        add_watchlist_entry(new_desc.strip())
+        st.toast("Added to watchlist")
+        st.rerun()
+
+    entries = get_watchlist()
+
+    if entries and processed:
+        if guarded(st.button("🔍 Scan all videos now")):
+            with st.spinner("Scanning all videos against watchlist..."):
+                wl_results = scan_watchlist(video_ids=processed)
+            for desc, n in wl_results:
+                if isinstance(n, int):
+                    st.write(f"• '{desc}' → {n} match(es)")
+                else:
+                    st.write(f"• '{desc}' → {n}")
+            st.rerun()
+
+    st.markdown('<div class="page-line"></div>', unsafe_allow_html=True)
+
+    if not entries:
+        st.info("No watchlist entries yet. Add a description above — every newly processed video will be checked against it automatically.")
+    else:
+        for entry_id, description, created_at in entries:
+            hcol1, hcol2 = st.columns([5, 1])
+            hcol1.markdown(f"**🎯 {description}**")
+            if guarded(hcol2.button("🗑️", key=f"wldel_{entry_id}")):
+                remove_watchlist_entry(entry_id)
+                st.rerun()
+
+            hits = get_watchlist_hits(entry_id)
+            if hits:
+                st.markdown(f"🚨 **{len(hits)} match(es):**")
+                hcols = st.columns(min(len(hits), 4))
+                for hi, (track_id, video_id, vtype, color, crop_path, ts) in enumerate(hits):
+                    with hcols[hi % len(hcols)]:
+                        if crop_path and os.path.exists(crop_path):
+                            st.image(crop_path, use_container_width=True)
+                        st.markdown(f"**{(vtype or 'vehicle').capitalize()}** · {color} · ⏱️ {ts:.1f}s")
+                        st.caption(f"📹 {video_id}")
+            else:
+                st.caption("No matches yet.")
+            st.markdown('<div class="page-line"></div>', unsafe_allow_html=True)
 
     render_footer()
 

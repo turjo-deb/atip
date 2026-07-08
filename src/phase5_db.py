@@ -28,6 +28,23 @@ def init_db():
             UNIQUE(video_id, track_id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            active INTEGER DEFAULT 1
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist_hits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER,
+            video_id TEXT,
+            track_id TEXT,
+            UNIQUE(entry_id, video_id, track_id)
+        )
+    """)
     # migration: add saved column if missing
     cur.execute("PRAGMA table_info(vehicles)")
     cols = [row[1] for row in cur.fetchall()]
