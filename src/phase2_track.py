@@ -8,13 +8,19 @@ import argparse
 from ultralytics import YOLO
 
 TARGET_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-ZONE_MARGIN = 25
-LOST_TRACK_BUFFER_FRAMES = 8
+
+# --- single counting line (replaces the old dual-zone system) ---
+LINE_POSITION = 0.75       # fraction of frame height where the counting line sits
+LINE_MARGIN = 15          # hysteresis band (px) around the line to avoid flicker double-counts
 LOST_TRACK_ZONE_MARGIN = 30
+LOST_TRACK_BUFFER_FRAMES = 8
 LOST_TRACK_MIN_FRAMES_SEEN = 3
 TRACK_TIMEOUT_FRAMES = 10
 IOU_REATTACH_THRESHOLD = 0.25
 IOU_SEARCH_MAX_LOST_FRAMES = LOST_TRACK_BUFFER_FRAMES
+
+MIN_CROP_AREA = 3000      # px^2 — crops smaller than this are junk, never saved/analyzed
+CROP_MIN_DIM = 200        # upscale crops smaller than this (helps VLM + UI thumbnail quality)
 
 _model = None
 
@@ -40,9 +46,18 @@ def iou(box_a, box_b):
     return inter / float(area_a + area_b - inter)
 
 
+def upscale_if_small(img):
+    h, w = img.shape[:2]
+    m = min(h, w)
+    if m <= 0 or m >= CROP_MIN_DIM:
+        return img
+    scale = CROP_MIN_DIM / m
+    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+
 def run_phase2(video_path, progress_callback=None):
     """
-    Runs detection + dual-zone tracking on a video.
+    Runs detection + single-line tracking on a video.
     progress_callback(frame_count, total_frames, confirmed_count) is called periodically if provided.
     Returns a summary dict.
     """
@@ -69,10 +84,9 @@ def run_phase2(video_path, progress_callback=None):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
-    ZONES = [
-        {"name": "zone1", "center": int(h * 0.35), "top": int(h * 0.35) - ZONE_MARGIN, "bottom": int(h * 0.35) + ZONE_MARGIN},
-        {"name": "zone2", "center": int(h * 0.65), "top": int(h * 0.65) - ZONE_MARGIN, "bottom": int(h * 0.65) + ZONE_MARGIN},
-    ]
+    LINE_Y = int(h * LINE_POSITION)
+    LINE_TOP = LINE_Y - LINE_MARGIN
+    LINE_BOTTOM = LINE_Y + LINE_MARGIN
 
     tracks = {}
     vehicle_count = 0
@@ -83,30 +97,22 @@ def run_phase2(video_path, progress_callback=None):
         return {
             "first_seen": frame_idx, "last_seen": frame_idx,
             "prev_bottom": None, "prev_box": None, "best_crop": None,
-            "best_conf": -1.0, "votes": {}, "final_class": None,
+            "best_score": -1.0, "best_conf": -1.0, "votes": {}, "final_class": None,
             "counted": False, "direction": None, "lost_frames": 0,
-            "zone_state": {z["name"]: "NEW" for z in ZONES},
+            "side": None,  # "above" or "below" the line, set once track is clearly on one side
         }
 
-    def in_zone(bottom_y, zone):
-        return zone["top"] <= bottom_y <= zone["bottom"]
+    def side_of(bottom_y):
+        if bottom_y < LINE_TOP:
+            return "above"
+        if bottom_y > LINE_BOTTOM:
+            return "below"
+        return None  # inside the hysteresis band — ambiguous, don't commit yet
 
-    def crossed_zone(prev_bottom, curr_bottom, zone):
-        if prev_bottom is None:
-            return None
-        if prev_bottom < zone["top"] and curr_bottom > zone["bottom"]:
-            return "down"
-        if prev_bottom > zone["bottom"] and curr_bottom < zone["top"]:
-            return "up"
-        return None
-
-    def near_any_zone(bottom_y):
+    def near_line(bottom_y):
         if bottom_y is None:
             return False
-        for z in ZONES:
-            if z["top"] - LOST_TRACK_ZONE_MARGIN <= bottom_y <= z["bottom"] + LOST_TRACK_ZONE_MARGIN:
-                return True
-        return False
+        return (LINE_TOP - LOST_TRACK_ZONE_MARGIN) <= bottom_y <= (LINE_BOTTOM + LOST_TRACK_ZONE_MARGIN)
 
     def finalize_class(track):
         if not track["votes"]:
@@ -116,13 +122,16 @@ def run_phase2(video_path, progress_callback=None):
     def save_crop(track_id, track, frame_idx):
         if track["best_crop"] is None or track["best_crop"].size == 0:
             return None
+        area = track["best_crop"].shape[0] * track["best_crop"].shape[1]
+        if area < MIN_CROP_AREA:
+            return None  # junk crop — too small to be useful, skip saving/analyzing entirely
         cls = track["final_class"] or finalize_class(track)
         filename = f"vehicle_{track_id}_{cls}_{frame_idx}.jpg"
         path = os.path.join(crops_dir, filename)
-        cv2.imwrite(path, track["best_crop"])
+        cv2.imwrite(path, upscale_if_small(track["best_crop"]))
         return path
 
-    def confirm_counted(track_id, track, frame_idx, direction, zone_name):
+    def confirm_counted(track_id, track, frame_idx, direction):
         nonlocal vehicle_count
         if track["counted"]:
             return
@@ -143,7 +152,7 @@ def run_phase2(video_path, progress_callback=None):
             "counted_frame": frame_idx,
             "best_conf": track["best_conf"],
             "direction": direction,
-            "confirmed_by": zone_name,
+            "confirmed_by": "line",
         })
 
     def process_detection(track_id, box, conf, cls, frame, frame_count):
@@ -160,31 +169,22 @@ def run_phase2(video_path, progress_callback=None):
         t["lost_frames"] = 0
         t["votes"][class_name] = t["votes"].get(class_name, 0) + 1
 
-        if crop.size > 0 and conf > t["best_conf"]:
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        score = area * float(conf)
+        if crop.size > 0 and score > t["best_score"]:
+            t["best_score"] = score
             t["best_conf"] = float(conf)
             t["best_crop"] = crop.copy()
 
         if not t["counted"]:
-            for z in ZONES:
-                zname = z["name"]
-                zstate = t["zone_state"][zname]
-
-                if zstate == "NEW":
-                    if not in_zone(bottom_y, z):
-                        t["zone_state"][zname] = "ARMED"
-                elif zstate == "ARMED":
-                    if in_zone(bottom_y, z):
-                        t["zone_state"][zname] = "INSIDE_ZONE"
-                    else:
-                        direction = crossed_zone(t["prev_bottom"], bottom_y, z)
-                        if direction is not None:
-                            confirm_counted(track_id, t, frame_count, direction, zname)
-                            break
-                elif zstate == "INSIDE_ZONE":
-                    if not in_zone(bottom_y, z):
-                        direction = "down" if bottom_y > z["bottom"] else "up"
-                        confirm_counted(track_id, t, frame_count, direction, zname)
-                        break
+            current_side = side_of(bottom_y)
+            if t["side"] is None:
+                if current_side is not None:
+                    t["side"] = current_side
+            else:
+                if current_side is not None and current_side != t["side"]:
+                    direction = "down" if t["side"] == "above" else "up"
+                    confirm_counted(track_id, t, frame_count, direction)
 
         t["prev_bottom"] = bottom_y
         t["prev_box"] = (x1, y1, x2, y2)
@@ -207,10 +207,9 @@ def run_phase2(video_path, progress_callback=None):
         frame = result.orig_img
         annotated = frame.copy()
 
-        for z in ZONES:
-            cv2.rectangle(annotated, (0, z["top"]), (w, z["bottom"]), (0, 255, 255), 2)
-            cv2.putText(annotated, z["name"].upper(), (20, z["top"] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.line(annotated, (0, LINE_Y), (w, LINE_Y), (0, 255, 255), 2)
+        cv2.putText(annotated, "COUNT LINE", (20, LINE_Y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         seen_ids_this_frame = set()
         matched_lost_ids = set()
@@ -278,19 +277,13 @@ def run_phase2(video_path, progress_callback=None):
             t = tracks[tid]
             t["lost_frames"] += 1
             frames_observed = t["last_seen"] - t["first_seen"]
-            near_zone = near_any_zone(t["prev_bottom"])
+            close_to_line = near_line(t["prev_bottom"])
 
-            any_armed_or_inside = any(
-                t["zone_state"][z["name"]] in ("ARMED", "INSIDE_ZONE") for z in ZONES
-            )
-
-            if (any_armed_or_inside and near_zone and
+            if (t["side"] is not None and close_to_line and
                     frames_observed >= LOST_TRACK_MIN_FRAMES_SEEN):
                 if t["lost_frames"] >= LOST_TRACK_BUFFER_FRAMES:
-                    if t["prev_bottom"] is not None:
-                        closest_zone = min(ZONES, key=lambda z: abs(z["center"] - t["prev_bottom"]))
-                        direction = "down" if t["prev_bottom"] >= closest_zone["center"] else "up"
-                        confirm_counted(tid, t, frame_count, direction, "lost_fallback")
+                    direction = "down" if t["side"] == "above" else "up"
+                    confirm_counted(tid, t, frame_count, direction)
 
         for tid in list(tracks.keys()):
             t = tracks[tid]
@@ -309,14 +302,9 @@ def run_phase2(video_path, progress_callback=None):
             progress_callback(frame_count, total_frames, vehicle_count)
 
     for tid, t in tracks.items():
-        if not t["counted"] and t["prev_bottom"] is not None:
-            any_armed_or_inside = any(
-                t["zone_state"][z["name"]] in ("ARMED", "INSIDE_ZONE") for z in ZONES
-            )
-            if any_armed_or_inside and near_any_zone(t["prev_bottom"]):
-                closest_zone = min(ZONES, key=lambda z: abs(z["center"] - t["prev_bottom"]))
-                direction = "down" if t["prev_bottom"] >= closest_zone["center"] else "up"
-                confirm_counted(tid, t, frame_count, direction, "end_of_video_fallback")
+        if not t["counted"] and t["side"] is not None and near_line(t["prev_bottom"]):
+            direction = "down" if t["side"] == "above" else "up"
+            confirm_counted(tid, t, frame_count, direction)
 
     out.release()
     import subprocess
@@ -334,7 +322,7 @@ def run_phase2(video_path, progress_callback=None):
             os.replace(temp_path, input_path)
         except Exception as e:
             print(f"Warning: re-encode failed ({e}), video may not play in browser")
-    reencode_for_browser(output_path)  
+    reencode_for_browser(output_path)
 
     with open(timestamps_json, "w") as f:
         json.dump({"video_id": video_id, "fps": fps, "first_seen_frame": first_seen_frame}, f, indent=2)

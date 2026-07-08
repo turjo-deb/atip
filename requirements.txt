@@ -10,3 +10,5 @@ pandas
 plotly
 numpy
 lapx
+requests
+yt-dlp

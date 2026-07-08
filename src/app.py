@@ -6,9 +6,10 @@ import os
 import sys
 import json
 import shutil
+import requests
+import yt_dlp
 import pandas as pd
 import plotly.express as px
-from phase_verify import verify_truck_bus
 
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -16,7 +17,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from phase2_track import run_phase2
 from phase3_color import run_phase3
 from phase5_db import run_phase5, init_db, DB_PATH
-from phase6_search import search
+from phase6_search import search_multi, run_eager_vlm
 
 st.set_page_config(page_title="TrafficLens", layout="wide", initial_sidebar_state="expanded")
 
@@ -135,6 +136,14 @@ def get_saved_items():
     conn.close()
     return rows
 
+def reset_vlm_cache(video_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE vehicles SET vlm_analyzed=0, vlm_data=NULL WHERE video_id=?", (video_id,))
+    conn.commit()
+    conn.close()
+
+
 def delete_video(video_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -211,15 +220,22 @@ if uploaded_file is not None:
 
         try:
             summary2 = run_phase2(save_path, progress_callback=progress_callback)
+            video_id = os.path.splitext(os.path.basename(save_path))[0]
             with st.sidebar:
                 with st.spinner("Analyzing colors..."):
                     run_phase3(save_path)
-                with st.spinner("Verifying truck/bus classifications..."):
-                    verify_result = verify_truck_bus(save_path)
-                    if verify_result["corrected"] > 0:
-                        st.info(f"Corrected {verify_result['corrected']} truck/bus mismatches")
                 with st.spinner("Indexing..."):
                     run_phase5(save_path)
+
+                vlm_progress = st.progress(0, text="Analyzing vehicles with AI...")
+
+                def vlm_progress_cb(done, total):
+                    pct = min(done / max(total, 1), 1.0)
+                    vlm_progress.progress(pct, text=f"Analyzing vehicles with AI... {done}/{total}")
+
+                vlm_summary = run_eager_vlm(video_id, progress_callback=vlm_progress_cb)
+                if vlm_summary["corrected"] > 0:
+                    st.info(f"AI corrected {vlm_summary['corrected']} vehicle classifications")
 
             st.session_state.is_processing = False
             st.sidebar.success(f"✅ {summary2['confirmed']} vehicles indexed")
@@ -230,14 +246,102 @@ if uploaded_file is not None:
             st.exception(e)
 
 st.sidebar.markdown('<div class="nav-divider"></div>', unsafe_allow_html=True)
+st.sidebar.subheader("🔗 Or paste video link")
+video_url = st.sidebar.text_input(
+    "YouTube / Facebook / direct .mp4 link",
+    label_visibility="collapsed",
+    placeholder="https://youtube.com/watch?v=... or direct video URL"
+)
+
+
+def is_direct_file_link(url):
+    return url.lower().split("?")[0].endswith((".mp4", ".avi", ".mov"))
+
+
+def download_with_ytdlp(url, dest_dir):
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+        "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info).rsplit(".", 1)[0] + ".mp4"
+
+
+if video_url and st.sidebar.button("⬇️ Download & process", use_container_width=True, disabled=st.session_state.is_processing):
+    st.session_state.is_processing = True
+
+    try:
+        with st.sidebar:
+            with st.spinner("Downloading..."):
+                if is_direct_file_link(video_url):
+                    fname = video_url.split("/")[-1].split("?")[0]
+                    link_save_path = os.path.join(VIDEOS_DIR, fname)
+                    r = requests.get(video_url, stream=True, timeout=30)
+                    r.raise_for_status()
+                    with open(link_save_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            f.write(chunk)
+                else:
+                    link_save_path = download_with_ytdlp(video_url, VIDEOS_DIR)
+
+        link_progress_bar = st.sidebar.progress(0, text="Detecting & tracking...")
+
+        def link_progress_callback(fc, tf, conf):
+            link_progress_bar.progress(min(fc / max(tf, 1), 1.0), text=f"Frame {fc}/{tf} · {conf} found")
+
+        link_summary2 = run_phase2(link_save_path, progress_callback=link_progress_callback)
+        link_video_id = os.path.splitext(os.path.basename(link_save_path))[0]
+        with st.sidebar:
+            with st.spinner("Analyzing colors..."):
+                run_phase3(link_save_path)
+            with st.spinner("Indexing..."):
+                run_phase5(link_save_path)
+
+            link_vlm_progress = st.progress(0, text="Analyzing vehicles with AI...")
+
+            def link_vlm_progress_cb(done, total):
+                pct = min(done / max(total, 1), 1.0)
+                link_vlm_progress.progress(pct, text=f"Analyzing vehicles with AI... {done}/{total}")
+
+            link_vlm_summary = run_eager_vlm(link_video_id, progress_callback=link_vlm_progress_cb)
+            if link_vlm_summary["corrected"] > 0:
+                st.info(f"AI corrected {link_vlm_summary['corrected']} vehicle classifications")
+
+        st.session_state.is_processing = False
+        st.sidebar.success(f"✅ {link_summary2['confirmed']} vehicles indexed")
+        st.rerun()
+    except Exception as e:
+        st.session_state.is_processing = False
+        st.sidebar.error(f"❌ Failed: {e}")
+        st.exception(e)
+
+st.sidebar.markdown('<div class="nav-divider"></div>', unsafe_allow_html=True)
 st.sidebar.subheader("🗑️ Manage videos")
 
 _processed_for_delete = get_processed_videos()
 if _processed_for_delete:
     for vid in _processed_for_delete:
-        col1, col2 = st.sidebar.columns([3, 1])
+        col1, col2, col3 = st.sidebar.columns([3, 1, 1])
         col1.write(vid)
-        if guarded(col2.button("🗑️", key=f"delvid_{vid}")):
+        if guarded(col2.button("🔄", key=f"reanalyze_{vid}", help="Re-analyze with latest AI prompt")):
+            reset_vlm_cache(vid)
+            reanalyze_progress = st.sidebar.progress(0, text="Re-analyzing...")
+
+            def reanalyze_cb(done, total):
+                reanalyze_progress.progress(min(done / max(total, 1), 1.0), text=f"Re-analyzing... {done}/{total}")
+
+            reanalyze_summary = run_eager_vlm(vid, progress_callback=reanalyze_cb)
+            st.sidebar.success(
+                f"Re-analyzed {reanalyze_summary['analyzed']}/{reanalyze_summary['total']} "
+                f"({reanalyze_summary['corrected']} corrected)"
+            )
+            st.rerun()
+        if guarded(col3.button("🗑️", key=f"delvid_{vid}")):
             delete_video(vid)
             st.sidebar.success(f"Deleted {vid}")
             st.rerun()
@@ -322,9 +426,7 @@ elif page == "🔍 Analyze":
 
             all_matches = []
             with st.spinner("Searching..."):
-                for vid in search_scope:
-                    filters, matches = search(query, video_id=vid, on_vlm_call=on_vlm_call)
-                    all_matches.extend(matches)
+                filters, all_matches = search_multi(query, video_ids=search_scope, on_vlm_call=on_vlm_call)
             status_placeholder.empty()
 
             st.write(f"**{len(all_matches)} result(s)** across {len(search_scope)} video(s)")
@@ -338,11 +440,20 @@ elif page == "🔍 Analyze":
                         st.markdown(f"**{m['vehicle_type'].capitalize()}** · {m['color']} · ⏱️ {m['timestamp_seconds']:.1f}s")
                         st.caption(f"📹 {m['video_id']}")
 
-                        tags = (m["vlm_data"].get("description", []) if m["vlm_data"] else [])
-                        cargo = (m["vlm_data"].get("cargo", []) if m["vlm_data"] else [])
-                        pills = "".join(f'<span class="pill">{t}</span>' for t in (tags + cargo))
+                        vd = m["vlm_data"] or {}
+                        tags = vd.get("description", [])
+                        cargo = vd.get("cargo", [])
+                        roof = vd.get("roof_items", [])
+                        ads = vd.get("advertisement_or_text", [])
+                        pills = "".join(f'<span class="pill">{t}</span>' for t in (tags + cargo + roof + ads))
                         if pills:
                             st.markdown(pills, unsafe_allow_html=True)
+                        if cargo:
+                            loc = vd.get("cargo_location")
+                            loc_txt = f" ({loc.replace('_', ' ')})" if loc and loc != "none" else ""
+                            st.caption(f"🚛 Carrying: {', '.join(cargo)}{loc_txt}")
+                        if ads:
+                            st.caption(f"📝 Text/logo: {', '.join(ads)}")
 
                         if guarded(st.button("💾 Save", key=f"save_{m['video_id']}_{m['track_id']}")):
                             toggle_saved(m["video_id"], m["track_id"], 1)
@@ -376,10 +487,17 @@ else:
 
                 if vlm_data_raw:
                     vlm_data = json.loads(vlm_data_raw)
-                    tags = vlm_data.get("description", []) + vlm_data.get("cargo", [])
+                    cargo = vlm_data.get("cargo", [])
+                    roof = vlm_data.get("roof_items", [])
+                    ads = vlm_data.get("advertisement_or_text", [])
+                    tags = vlm_data.get("description", []) + cargo + roof + ads
                     pills = "".join(f'<span class="pill">{t}</span>' for t in tags)
                     if pills:
                         st.markdown(pills, unsafe_allow_html=True)
+                    if cargo:
+                        loc = vlm_data.get("cargo_location")
+                        loc_txt = f" ({loc.replace('_', ' ')})" if loc and loc != "none" else ""
+                        st.caption(f"🚛 Carrying: {', '.join(cargo)}{loc_txt}")
 
                 if guarded(st.button("🗑️ Remove", key=f"del_{video_id}_{track_id}")):
                     toggle_saved(video_id, track_id, 0)
